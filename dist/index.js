@@ -171,26 +171,35 @@ function getAIResponse(prompt) {
             model: OPENAI_API_MODEL,
             temperature: 0.2,
             max_tokens: 700,
-            top_p: 1,
-            frequency_penalty: 0,
-            presence_penalty: 0,
         };
-        try {
-            const response = yield openai.chat.completions.create(Object.assign(Object.assign(Object.assign({}, queryConfig), (OPENAI_API_MODEL === "gpt-4-1106-preview"
-                ? { response_format: { type: "json_object" } }
-                : {})), { messages: [
-                    {
-                        role: "system",
-                        content: prompt,
-                    },
-                ] }));
-            const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
-            return JSON.parse(res).reviews;
+        const maxRetries = 2;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const response = yield openai.chat.completions.create(Object.assign(Object.assign({}, queryConfig), { response_format: { type: "json_object" }, messages: [
+                        {
+                            role: "system",
+                            content: prompt,
+                        },
+                    ] }));
+                const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim())
+                    || '{"reviews":[]}';
+                const parsed = JSON.parse(res);
+                if (!parsed.reviews || !Array.isArray(parsed.reviews)) {
+                    console.warn("Invalid reviews format:", parsed);
+                    return [];
+                }
+                return parsed.reviews;
+            }
+            catch (error) {
+                console.warn(`Retry ${attempt + 1} failed`, error);
+                if (attempt === maxRetries) {
+                    console.error("Final failure calling OpenAI:", error);
+                    return null;
+                }
+                yield new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+            }
         }
-        catch (error) {
-            console.error("Error:", error);
-            return null;
-        }
+        return null;
     });
 }
 function createComment(file, chunk, aiResponses) {

@@ -148,35 +148,59 @@ async function getAIResponse(
     reviewComment: string;
   }> | null
 > {
+
   const queryConfig = {
     model: OPENAI_API_MODEL,
     temperature: 0.2,
     max_tokens: 700,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0,
   };
 
-  try {
-    const response = await openai.chat.completions.create({
-      ...queryConfig,
-      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-        ? { response_format: { type: "json_object" } }
-        : {}),
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-      ],
-    });
+  const maxRetries = 2;
 
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    return JSON.parse(res).reviews;
-  } catch (error) {
-    console.error("Error:", error);
-    return null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+
+    try {
+
+      const response = await openai.chat.completions.create({
+        ...queryConfig,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: prompt,
+          },
+        ],
+      });
+
+      const res =
+        response.choices[0].message?.content?.trim()
+        || '{"reviews":[]}';
+
+      const parsed = JSON.parse(res);
+
+      if (!parsed.reviews || !Array.isArray(parsed.reviews)) {
+        console.warn("Invalid reviews format:", parsed);
+        return [];
+      }
+
+      return parsed.reviews;
+
+    } catch (error) {
+
+      console.warn(`Retry ${attempt + 1} failed`, error);
+
+      if (attempt === maxRetries) {
+        console.error("Final failure calling OpenAI:", error);
+        return null;
+      }
+
+      await new Promise(resolve =>
+        setTimeout(resolve, 1000 * (attempt + 1))
+      );
+    }
   }
+
+  return null;
 }
 
 function createComment(
