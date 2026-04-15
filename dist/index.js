@@ -51,6 +51,7 @@ const minimatch_1 = __importDefault(__nccwpck_require__(2002));
 const GITHUB_TOKEN = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
+const REVIEW_PROMPT = core.getInput("REVIEW_PROMPT");
 const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
 const openai = new openai_1.default({
     apiKey: OPENAI_API_KEY,
@@ -90,7 +91,7 @@ function analyzeCode(parsedDiff, prDetails) {
         const comments = [];
         for (const file of parsedDiff) {
             if (file.to === "/dev/null")
-                continue; // Ignore deleted files
+                continue;
             for (const chunk of file.chunks) {
                 const prompt = createPrompt(file, chunk, prDetails);
                 const aiResponse = yield getAIResponse(prompt);
@@ -106,29 +107,58 @@ function analyzeCode(parsedDiff, prDetails) {
     });
 }
 function createPrompt(file, chunk, prDetails) {
-    return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
-- Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the comment in GitHub Markdown format.
-- Use the given description only for the overall context and only comment the code.
-- IMPORTANT: NEVER suggest adding comments to the code.
+    const defaultPrompt = `You are a senior code reviewer for a production Laravel and Vue application.
 
-Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
-  
+Your job is to review pull request diffs and report only actionable, high-value issues.
+Do not provide praise, summaries, explanations of what the code does, or low-value suggestions.
+
+Return valid JSON only in this format:
+{"reviews":[{"lineNumber":123,"reviewComment":"comment here"}]}
+
+Rules:
+- Only report issues that are important enough to justify a GitHub PR comment.
+- Do not comment unless the issue could cause a bug, security problem, performance regression, broken UX, or meaningful maintenance risk.
+- If there are no meaningful issues, return {"reviews":[]}.
+- Keep comments concise, direct, and specific.
+- Write in GitHub Markdown format.
+- Do not repeat what is already obvious from the diff.
+- Do not suggest adding comments to the code.
+- Do not make style-only suggestions unless they affect correctness, maintainability, security, or readability in a meaningful way.
+- Do not comment on formatting, naming preferences, or minor refactoring ideas unless they create a real problem.
+- Prefer one strong comment over several small overlapping comments.
+- Only comment on changed lines or on a nearby changed line when necessary for context.
+- Do not speculate. Comment only when the risk is reasonably supported by the diff.
+- Do not mention that you are an AI.
+
+Review priorities:
+- Correctness, edge cases, and data integrity
+- Laravel validation, authorization, Eloquent/query efficiency, transactions, queues, cache behavior, API compatibility, and unsafe input handling
+- Vue reactivity, async state handling, prop misuse, rendering logic, event/timer cleanup, XSS risk, and form behavior
+- Laravel/Vue contract mismatches between backend responses and frontend expectations
+- Maintainability issues only when they create real fragility or future bug risk
+
+Comment style:
+- Start with the issue.
+- Briefly explain the risk.
+- Suggest a fix only when it is clear and short.
+- Keep the tone neutral and professional.
+- Avoid long comments.
+
+Use the pull request title and description only as context. Review only the code changes.`;
+    const promptHeader = (REVIEW_PROMPT === null || REVIEW_PROMPT === void 0 ? void 0 : REVIEW_PROMPT.trim()) ? REVIEW_PROMPT : defaultPrompt;
+    return `${promptHeader}
+
 Pull request title: ${prDetails.title}
 Pull request description:
-
 ---
 ${prDetails.description}
 ---
 
-Git diff to review:
-
+Review the following code diff for file "${file.to}":
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-        // @ts-expect-error - ln and ln2 exists where needed
+        // @ts-expect-error
         .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
         .join("\n")}
 \`\`\`
@@ -141,26 +171,35 @@ function getAIResponse(prompt) {
             model: OPENAI_API_MODEL,
             temperature: 0.2,
             max_tokens: 700,
-            top_p: 1,
-            frequency_penalty: 0,
-            presence_penalty: 0,
         };
-        try {
-            const response = yield openai.chat.completions.create(Object.assign(Object.assign(Object.assign({}, queryConfig), (OPENAI_API_MODEL === "gpt-4-1106-preview"
-                ? { response_format: { type: "json_object" } }
-                : {})), { messages: [
-                    {
-                        role: "system",
-                        content: prompt,
-                    },
-                ] }));
-            const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
-            return JSON.parse(res).reviews;
+        const maxRetries = 2;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const response = yield openai.chat.completions.create(Object.assign(Object.assign({}, queryConfig), { response_format: { type: "json_object" }, messages: [
+                        {
+                            role: "system",
+                            content: prompt,
+                        },
+                    ] }));
+                const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim())
+                    || '{"reviews":[]}';
+                const parsed = JSON.parse(res);
+                if (!parsed.reviews || !Array.isArray(parsed.reviews)) {
+                    console.warn("Invalid reviews format:", parsed);
+                    return [];
+                }
+                return parsed.reviews;
+            }
+            catch (error) {
+                console.warn(`Retry ${attempt + 1} failed`, error);
+                if (attempt === maxRetries) {
+                    console.error("Final failure calling OpenAI:", error);
+                    return null;
+                }
+                yield new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+            }
         }
-        catch (error) {
-            console.error("Error:", error);
-            return null;
-        }
+        return null;
     });
 }
 function createComment(file, chunk, aiResponses) {
