@@ -97,7 +97,7 @@ function analyzeCode(parsedDiff, prDetails) {
                 const aiResponse = yield getAIResponse(prompt);
                 if (aiResponse) {
                     const newComments = createComment(file, chunk, aiResponse);
-                    if (newComments) {
+                    if (newComments.length > 0) {
                         comments.push(...newComments);
                     }
                 }
@@ -129,6 +129,9 @@ Rules:
 - Only comment on changed lines or on a nearby changed line when necessary for context.
 - Do not speculate. Comment only when the risk is reasonably supported by the diff.
 - Do not mention that you are an AI.
+- Only use line numbers that correspond to added lines in the provided diff.
+- Do not comment on deleted lines, file-level concerns, or guessed line numbers.
+- If no valid added line is appropriate, return {"reviews":[]}.
 
 Review priorities:
 - Correctness, edge cases, and data integrity
@@ -181,8 +184,7 @@ function getAIResponse(prompt) {
                             content: prompt,
                         },
                     ] }));
-                const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim())
-                    || '{"reviews":[]}';
+                const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || '{"reviews":[]}';
                 const parsed = JSON.parse(res);
                 if (!parsed.reviews || !Array.isArray(parsed.reviews)) {
                     console.warn("Invalid reviews format:", parsed);
@@ -196,23 +198,47 @@ function getAIResponse(prompt) {
                     console.error("Final failure calling OpenAI:", error);
                     return null;
                 }
-                yield new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+                yield new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
             }
         }
         return null;
     });
 }
 function createComment(file, chunk, aiResponses) {
+    const filePath = file.to;
+    if (!filePath) {
+        return [];
+    }
+    const validLines = new Set();
+    for (const change of chunk.changes) {
+        if (change.type === "add" && typeof change.ln === "number") {
+            validLines.add(change.ln);
+        }
+    }
     return aiResponses.flatMap((aiResponse) => {
-        if (!file.to) {
+        var _a;
+        const line = Number(aiResponse.lineNumber);
+        const body = (_a = aiResponse.reviewComment) === null || _a === void 0 ? void 0 : _a.trim();
+        if (!Number.isInteger(line) || !validLines.has(line)) {
+            console.warn(`Skipping invalid review comment for ${filePath} at line ${aiResponse.lineNumber}`);
+            return [];
+        }
+        if (!body) {
+            console.warn(`Skipping empty review comment for ${filePath} at line ${aiResponse.lineNumber}`);
             return [];
         }
         return {
-            body: aiResponse.reviewComment,
-            path: file.to,
-            line: Number(aiResponse.lineNumber),
+            body,
+            path: filePath,
+            line,
         };
     });
+}
+function dedupeComments(comments) {
+    return Array.from(new Map(comments.map((comment) => [
+        `${comment.path}:${comment.line}:${comment.body}`,
+        comment,
+    ])).values());
 }
 function createReviewComment(owner, repo, pull_number, comments) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -260,13 +286,18 @@ function main() {
         const excludePatterns = core
             .getInput("exclude")
             .split(",")
-            .map((s) => s.trim());
+            .map((s) => s.trim())
+            .filter(Boolean);
         const filteredDiff = parsedDiff.filter((file) => {
             return !excludePatterns.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : "", pattern); });
         });
         const comments = yield analyzeCode(filteredDiff, prDetails);
-        if (comments.length > 0) {
-            yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
+        const uniqueComments = dedupeComments(comments);
+        if (uniqueComments.length > 0) {
+            yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, uniqueComments);
+        }
+        else {
+            console.log("No valid review comments to submit");
         }
     });
 }
