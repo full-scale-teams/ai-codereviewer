@@ -24,15 +24,28 @@ interface PRDetails {
   description: string;
 }
 
+interface AIReview {
+  lineNumber: string;
+  reviewComment: string;
+}
+
+interface ReviewComment {
+  body: string;
+  path: string;
+  line: number;
+}
+
 async function getPRDetails(): Promise<PRDetails> {
   const { repository, number } = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
+      readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
   );
+
   const prResponse = await octokit.pulls.get({
     owner: repository.owner.login,
     repo: repository.name,
     pull_number: number,
   });
+
   return {
     owner: repository.owner.login,
     repo: repository.name,
@@ -43,9 +56,9 @@ async function getPRDetails(): Promise<PRDetails> {
 }
 
 async function getDiff(
-  owner: string,
-  repo: string,
-  pull_number: number
+    owner: string,
+    repo: string,
+    pull_number: number
 ): Promise<string | null> {
   const response = await octokit.pulls.get({
     owner,
@@ -53,29 +66,33 @@ async function getDiff(
     pull_number,
     mediaType: { format: "diff" },
   });
+
   // @ts-expect-error - response.data is a string
   return response.data;
 }
 
 async function analyzeCode(
-  parsedDiff: File[],
-  prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
+    parsedDiff: File[],
+    prDetails: PRDetails
+): Promise<ReviewComment[]> {
+  const comments: ReviewComment[] = [];
 
   for (const file of parsedDiff) {
     if (file.to === "/dev/null") continue;
+
     for (const chunk of file.chunks) {
       const prompt = createPrompt(file, chunk, prDetails);
       const aiResponse = await getAIResponse(prompt);
+
       if (aiResponse) {
         const newComments = createComment(file, chunk, aiResponse);
-        if (newComments) {
+        if (newComments.length > 0) {
           comments.push(...newComments);
         }
       }
     }
   }
+
   return comments;
 }
 
@@ -102,6 +119,9 @@ Rules:
 - Only comment on changed lines or on a nearby changed line when necessary for context.
 - Do not speculate. Comment only when the risk is reasonably supported by the diff.
 - Do not mention that you are an AI.
+- Only use line numbers that correspond to added lines in the provided diff.
+- Do not comment on deleted lines, file-level concerns, or guessed line numbers.
+- If no valid added line is appropriate, return {"reviews":[]}.
 
 Review priorities:
 - Correctness, edge cases, and data integrity
@@ -140,15 +160,7 @@ ${chunk.changes
 `;
 }
 
-async function getAIResponse(
-  prompt: string
-): Promise<
-  Array<{
-    lineNumber: string;
-    reviewComment: string;
-  }> | null
-> {
-
+async function getAIResponse(prompt: string): Promise<AIReview[] | null> {
   const queryConfig = {
     model: OPENAI_API_MODEL,
     temperature: 0.2,
@@ -158,9 +170,7 @@ async function getAIResponse(
   const maxRetries = 2;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-
     try {
-
       const response = await openai.chat.completions.create({
         ...queryConfig,
         response_format: { type: "json_object" },
@@ -173,8 +183,7 @@ async function getAIResponse(
       });
 
       const res =
-        response.choices[0].message?.content?.trim()
-        || '{"reviews":[]}';
+          response.choices[0].message?.content?.trim() || '{"reviews":[]}';
 
       const parsed = JSON.parse(res);
 
@@ -184,9 +193,7 @@ async function getAIResponse(
       }
 
       return parsed.reviews;
-
     } catch (error) {
-
       console.warn(`Retry ${attempt + 1} failed`, error);
 
       if (attempt === maxRetries) {
@@ -194,8 +201,8 @@ async function getAIResponse(
         return null;
       }
 
-      await new Promise(resolve =>
-        setTimeout(resolve, 1000 * (attempt + 1))
+      await new Promise((resolve) =>
+          setTimeout(resolve, 1000 * (attempt + 1))
       );
     }
   }
@@ -204,30 +211,66 @@ async function getAIResponse(
 }
 
 function createComment(
-  file: File,
-  chunk: Chunk,
-  aiResponses: Array<{
-    lineNumber: string;
-    reviewComment: string;
-  }>
-): Array<{ body: string; path: string; line: number }> {
+    file: File,
+    chunk: Chunk,
+    aiResponses: AIReview[]
+): ReviewComment[] {
+  const filePath = file.to;
+
+  if (!filePath) {
+    return [];
+  }
+
+  const validLines = new Set<number>();
+
+  for (const change of chunk.changes) {
+    if (change.type === "add" && typeof change.ln === "number") {
+      validLines.add(change.ln);
+    }
+  }
+
   return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
+    const line = Number(aiResponse.lineNumber);
+    const body = aiResponse.reviewComment?.trim();
+
+    if (!Number.isInteger(line) || !validLines.has(line)) {
+      console.warn(
+          `Skipping invalid review comment for ${filePath} at line ${aiResponse.lineNumber}`
+      );
       return [];
     }
+
+    if (!body) {
+      console.warn(
+          `Skipping empty review comment for ${filePath} at line ${aiResponse.lineNumber}`
+      );
+      return [];
+    }
+
     return {
-      body: aiResponse.reviewComment,
-      path: file.to,
-      line: Number(aiResponse.lineNumber),
+      body,
+      path: filePath,
+      line,
     };
   });
 }
 
+function dedupeComments(comments: ReviewComment[]): ReviewComment[] {
+  return Array.from(
+      new Map(
+          comments.map((comment) => [
+            `${comment.path}:${comment.line}:${comment.body}`,
+            comment,
+          ])
+      ).values()
+  );
+}
+
 async function createReviewComment(
-  owner: string,
-  repo: string,
-  pull_number: number,
-  comments: Array<{ body: string; path: string; line: number }>
+    owner: string,
+    repo: string,
+    pull_number: number,
+    comments: ReviewComment[]
 ): Promise<void> {
   await octokit.pulls.createReview({
     owner,
@@ -241,15 +284,16 @@ async function createReviewComment(
 async function main() {
   const prDetails = await getPRDetails();
   let diff: string | null;
+
   const eventData = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
+      readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
 
   if (eventData.action === "opened") {
     diff = await getDiff(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number
+        prDetails.owner,
+        prDetails.repo,
+        prDetails.pull_number
     );
   } else if (eventData.action === "synchronize") {
     const newBaseSha = eventData.before;
@@ -279,24 +323,29 @@ async function main() {
   const parsedDiff = parseDiff(diff);
 
   const excludePatterns = core
-    .getInput("exclude")
-    .split(",")
-    .map((s) => s.trim());
+      .getInput("exclude")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
   const filteredDiff = parsedDiff.filter((file) => {
     return !excludePatterns.some((pattern) =>
-      minimatch(file.to ?? "", pattern)
+        minimatch(file.to ?? "", pattern)
     );
   });
 
   const comments = await analyzeCode(filteredDiff, prDetails);
-  if (comments.length > 0) {
+  const uniqueComments = dedupeComments(comments);
+
+  if (uniqueComments.length > 0) {
     await createReviewComment(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number,
-      comments
+        prDetails.owner,
+        prDetails.repo,
+        prDetails.pull_number,
+        uniqueComments
     );
+  } else {
+    console.log("No valid review comments to submit");
   }
 }
 
