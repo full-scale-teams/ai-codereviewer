@@ -433,3 +433,106 @@ test("the summary is posted exactly once when the batch fails", async (t) => {
   assert.match(calls.comments[0], /ReportService\.php:13/);
   assert.match(calls.comments[0], /Cannot be anchored\./);
 });
+
+// ---------------------------------------------------------------------------
+// Backward compatibility.
+//
+// The product repos already run `full-scale-teams/ai-codereviewer@main` from a
+// `pull_request` workflow. Publishing the new action upgrades those repos
+// whether or not their workflow changes, so the old configuration has to keep
+// working: four inputs, no TRIGGER_PHRASE, no PR_NUMBER, and crucially no
+// `issues: write` permission.
+// ---------------------------------------------------------------------------
+
+const legacyPullRequestEvent = () => ({
+  action: "opened",
+  number: 42,
+  pull_request: { number: 42 },
+  repository: { name: "rocks-api", owner: { login: "full-scale-teams" } },
+});
+
+/** Exactly the inputs the current product `main.yml` passes. */
+const LEGACY_INPUTS = {
+  OPENAI_API_MODEL: "gpt-4o-mini",
+  exclude: "**/*.lock,dist/**,**/*.json,**/*.md",
+};
+
+test("the existing product workflow still works when only the action is upgraded", async (t) => {
+  const { server, calls, port } = await startStub({
+    modelOutput: {
+      reviews: [
+        { lineNumber: 12, severity: "major", reviewComment: "Still reviewed." },
+      ],
+    },
+  });
+  t.after(() => server.close());
+
+  const result = await runAction({
+    port,
+    eventName: "pull_request",
+    event: legacyPullRequestEvent(),
+    inputs: LEGACY_INPUTS,
+  });
+
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.equal(calls.reviews.length, 1, "the review is still posted");
+  assert.equal(calls.reviews[0].comments.length, 1);
+  assert.equal(
+    calls.model[0].model,
+    "gpt-4o-mini",
+    "honours the configured model"
+  );
+
+  // No reaction is attempted on a pull_request run, so the workflow does NOT
+  // need the `issues: write` permission it currently lacks.
+  assert.deepEqual(
+    calls.reactions,
+    [],
+    "no reaction, so no issues:write needed"
+  );
+});
+
+test("an automatic pull_request run stays silent when it finds nothing", async (t) => {
+  // Otherwise upgrading the action would start posting a "nothing found"
+  // comment on every push to every open pull request.
+  const { server, calls, port } = await startStub({
+    modelOutput: { reviews: [] },
+  });
+  t.after(() => server.close());
+
+  const result = await runAction({
+    port,
+    eventName: "pull_request",
+    event: legacyPullRequestEvent(),
+    inputs: LEGACY_INPUTS,
+  });
+
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.deepEqual(
+    calls.comments,
+    [],
+    "no comment spam on a clean automatic run"
+  );
+  assert.deepEqual(calls.reviews, []);
+  assert.deepEqual(calls.reactions, []);
+});
+
+test("a failing automatic run does not post a failure comment on the pull request", async (t) => {
+  // A manual request reports failure in the thread because a person is waiting.
+  // An automatic run must not, or a model outage comments on every open PR.
+  const { server, calls, port } = await startStub({
+    modelOutput: { reviews: [] },
+    modelStatus: 500,
+  });
+  t.after(() => server.close());
+
+  const result = await runAction({
+    port,
+    eventName: "pull_request",
+    event: legacyPullRequestEvent(),
+    inputs: LEGACY_INPUTS,
+  });
+
+  assert.equal(result.code, 1, "the check still goes red");
+  assert.deepEqual(calls.comments, [], "but the pull request is not spammed");
+});
