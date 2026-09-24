@@ -21,17 +21,29 @@ import {
 import { buildInput, buildInstructions } from "./prompt";
 import { Reviewer } from "./reviewer";
 
-function summaryFor(
-  config: ActionConfig,
-  pr: PullRequestDetails,
-  filesReviewed: number,
-  skippedFiles: string[],
-  findings: Finding[],
-  unanchored: Finding[] = []
-): string {
+interface SummaryInput {
+  config: ActionConfig;
+  pr: PullRequestDetails;
+  filesReviewed: number;
+  skippedFiles?: string[];
+  findings?: Finding[];
+  unanchored?: Finding[];
+  /** The endpoint actually used, which differs from config after a fallback. */
+  endpoint?: string;
+}
+
+function summaryFor({
+  config,
+  pr,
+  filesReviewed,
+  skippedFiles = [],
+  findings = [],
+  unanchored = [],
+  endpoint = config.endpoint,
+}: SummaryInput): string {
   return buildSummary({
     model: config.model,
-    endpoint: config.endpoint,
+    endpoint,
     headSha: pr.headSha,
     filesReviewed,
     skippedFiles,
@@ -67,7 +79,7 @@ async function review(
         owner,
         repo,
         pullNumber,
-        summaryFor(config, pr, 0, [], [])
+        summaryFor({ config, pr, filesReviewed: 0 })
       );
     }
     return;
@@ -130,7 +142,13 @@ async function review(
         owner,
         repo,
         pullNumber,
-        summaryFor(config, pr, selected.length, skippedFiles, [])
+        summaryFor({
+          config,
+          pr,
+          filesReviewed: selected.length,
+          skippedFiles,
+          endpoint: reviewer.activeEndpoint,
+        })
       );
     }
     return;
@@ -141,7 +159,14 @@ async function review(
     repo,
     pullNumber,
     pr.headSha,
-    summaryFor(config, pr, selected.length, skippedFiles, findings),
+    summaryFor({
+      config,
+      pr,
+      filesReviewed: selected.length,
+      skippedFiles,
+      findings,
+      endpoint: reviewer.activeEndpoint,
+    }),
     findings
   );
 
@@ -153,14 +178,15 @@ async function review(
       owner,
       repo,
       pullNumber,
-      summaryFor(
+      summaryFor({
         config,
         pr,
-        selected.length,
+        filesReviewed: selected.length,
         skippedFiles,
         findings,
-        result.unanchored
-      )
+        unanchored: result.unanchored,
+        endpoint: reviewer.activeEndpoint,
+      })
     );
   }
 

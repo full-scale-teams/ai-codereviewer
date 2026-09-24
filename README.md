@@ -135,9 +135,16 @@ match the review schema rather than merely being valid JSON — which removes th
 "model returned prose, retry the whole call" failure mode. Requests are sent
 with `store: false`, so your source is not retained.
 
-`chat` selects the older Chat Completions endpoint. It is kept as a one-line
-escape hatch in case an organisation or a model is not enabled for the
-Responses API; it is not the recommended path.
+`chat` selects the older Chat Completions endpoint, with the same strict
+schema. You should not normally need it: if the Responses endpoint answers 404
+for your API key, the action logs a warning and falls back to Chat Completions
+for the rest of the run on its own, and the summary names the endpoint it
+actually used. Set `chat` explicitly only to make that permanent and skip the
+wasted first call.
+
+The fallback is deliberately narrow — a 401, 403, 429 or a bad-parameter 400
+fails the same way on either endpoint, so those are surfaced rather than
+retried and hidden.
 
 The model is deliberately an input rather than pinned in code. `gpt-4o` is the
 broadly available default; a stronger current model will find more, at higher

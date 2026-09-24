@@ -46,6 +46,7 @@ function startStub({
     reviews: [],
     comments: [],
     model: [],
+    chat: [],
     reviewComments: [],
   };
 
@@ -81,6 +82,24 @@ function startStub({
                 annotations: [],
               },
             ],
+          },
+        ],
+      });
+    }
+
+    if (req.method === "POST" && url === "/v1/chat/completions") {
+      calls.chat.push(JSON.parse(await readBody(req)));
+      return send(200, {
+        id: "chatcmpl_1",
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            finish_reason: "stop",
+            message: {
+              role: "assistant",
+              content: JSON.stringify(modelOutput),
+            },
           },
         ],
       });
@@ -535,4 +554,56 @@ test("a failing automatic run does not post a failure comment on the pull reques
 
   assert.equal(result.code, 1, "the check still goes red");
   assert.deepEqual(calls.comments, [], "but the pull request is not spammed");
+});
+
+test("an org without the Responses endpoint falls back to Chat Completions", async (t) => {
+  // Removes the only way upgrading the action could turn every pull request
+  // check red: a 404 on /v1/responses now degrades instead of failing.
+  const { server, calls, port } = await startStub({
+    modelOutput: {
+      reviews: [
+        { lineNumber: 12, severity: "major", reviewComment: "Found anyway." },
+      ],
+    },
+    modelStatus: 404,
+  });
+  t.after(() => server.close());
+
+  const result = await runAction({
+    port,
+    eventName: "issue_comment",
+    event: triggerEvent(),
+  });
+
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.ok(calls.model.length >= 1, "it tried the Responses endpoint first");
+  assert.equal(calls.chat.length, 1, "then fell back to Chat Completions");
+
+  // The finding still lands, and the fallback used the same strict schema.
+  assert.equal(calls.reviews.length, 1);
+  assert.equal(calls.reviews[0].comments[0].line, 12);
+  assert.equal(calls.chat[0].response_format.type, "json_schema");
+  assert.equal(calls.chat[0].response_format.json_schema.strict, true);
+
+  // The summary names the endpoint actually used, not the one configured.
+  assert.match(calls.reviews[0].body, /`chat` endpoint/);
+  // console.warn writes to stderr, not stdout.
+  assert.match(result.stderr, /falling back to Chat Completions/);
+});
+
+test("a 401 does NOT trigger the fallback, so a real auth error still surfaces", async (t) => {
+  const { server, calls, port } = await startStub({
+    modelOutput: { reviews: [] },
+    modelStatus: 401,
+  });
+  t.after(() => server.close());
+
+  const result = await runAction({
+    port,
+    eventName: "issue_comment",
+    event: triggerEvent(),
+  });
+
+  assert.equal(result.code, 1, "the run fails instead of hiding a bad key");
+  assert.deepEqual(calls.chat, [], "no pointless retry on the other endpoint");
 });

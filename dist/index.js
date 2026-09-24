@@ -705,10 +705,10 @@ const findings_1 = __nccwpck_require__(1417);
 const github_1 = __nccwpck_require__(5928);
 const prompt_1 = __nccwpck_require__(2063);
 const reviewer_1 = __nccwpck_require__(3187);
-function summaryFor(config, pr, filesReviewed, skippedFiles, findings, unanchored = []) {
+function summaryFor({ config, pr, filesReviewed, skippedFiles = [], findings = [], unanchored = [], endpoint = config.endpoint, }) {
     return (0, findings_1.buildSummary)({
         model: config.model,
-        endpoint: config.endpoint,
+        endpoint,
         headSha: pr.headSha,
         filesReviewed,
         skippedFiles,
@@ -729,7 +729,7 @@ function review(config, github, trigger, manual) {
         if (reviewable.length === 0) {
             core.info("No reviewable files in this diff.");
             if (manual) {
-                yield github.postComment(owner, repo, pullNumber, summaryFor(config, pr, 0, [], []));
+                yield github.postComment(owner, repo, pullNumber, summaryFor({ config, pr, filesReviewed: 0 }));
             }
             return;
         }
@@ -761,16 +761,37 @@ function review(config, github, trigger, manual) {
         if (findings.length === 0) {
             core.info("No issues found.");
             if (manual) {
-                yield github.postComment(owner, repo, pullNumber, summaryFor(config, pr, selected.length, skippedFiles, []));
+                yield github.postComment(owner, repo, pullNumber, summaryFor({
+                    config,
+                    pr,
+                    filesReviewed: selected.length,
+                    skippedFiles,
+                    endpoint: reviewer.activeEndpoint,
+                }));
             }
             return;
         }
-        const result = yield github.submitReview(owner, repo, pullNumber, pr.headSha, summaryFor(config, pr, selected.length, skippedFiles, findings), findings);
+        const result = yield github.submitReview(owner, repo, pullNumber, pr.headSha, summaryFor({
+            config,
+            pr,
+            filesReviewed: selected.length,
+            skippedFiles,
+            findings,
+            endpoint: reviewer.activeEndpoint,
+        }), findings);
         // On the batch path the summary rode along as the review body. On the
         // degraded path there was no review to carry it, so post it once here — now
         // that we know which findings could not be attached to a line.
         if (!result.summaryPosted) {
-            yield github.postComment(owner, repo, pullNumber, summaryFor(config, pr, selected.length, skippedFiles, findings, result.unanchored));
+            yield github.postComment(owner, repo, pullNumber, summaryFor({
+                config,
+                pr,
+                filesReviewed: selected.length,
+                skippedFiles,
+                findings,
+                unanchored: result.unanchored,
+                endpoint: reviewer.activeEndpoint,
+            }));
         }
         core.info(`Posted ${result.posted} inline comment(s).`);
     });
@@ -981,11 +1002,36 @@ exports.Reviewer = exports.parseFindings = void 0;
 const openai_1 = __importDefault(__nccwpck_require__(47));
 const prompt_1 = __nccwpck_require__(2063);
 const SCHEMA_NAME = "code_review";
+function describeApiError(error) {
+    return error instanceof openai_1.default.APIError
+        ? `HTTP ${error.status}`
+        : String(error);
+}
 /** Reasoning models reject `temperature`; detected from the 400 and retried without it. */
 function isUnsupportedTemperatureError(error) {
     return (error instanceof openai_1.default.APIError &&
         error.status === 400 &&
         /temperature/i.test(error.message));
+}
+/**
+ * Whether the failure says the Responses endpoint is not available to us.
+ *
+ * An organisation that has not been enabled for it answers 404 on the path.
+ * Without this, upgrading the action would turn every pull request check red
+ * in an org that could still call Chat Completions perfectly well.
+ *
+ * Deliberately narrow: auth (401/403), rate limits (429) and bad parameters
+ * (400) all fail the same way on either endpoint, so retrying them would only
+ * hide the real error.
+ */
+function isResponsesUnavailable(error) {
+    if (!(error instanceof openai_1.default.APIError))
+        return false;
+    if (error.status === 404)
+        return true;
+    return (error.status === 400 &&
+        /unsupported|not available|unrecognized/i.test(error.message) &&
+        /responses/i.test(error.message));
 }
 function isSeverity(value) {
     return prompt_1.SEVERITIES.includes(value);
@@ -1045,25 +1091,50 @@ class Reviewer {
             timeout: 120000,
         });
         this.temperature = config.temperature;
+        this.endpoint = config.endpoint;
+    }
+    /** The endpoint actually in use, which may differ after a fallback. */
+    get activeEndpoint() {
+        return this.endpoint;
     }
     review(instructions, input) {
         return __awaiter(this, void 0, void 0, function* () {
-            try {
-                return yield this.request(instructions, input);
-            }
-            catch (error) {
-                if (!isUnsupportedTemperatureError(error) ||
-                    this.temperature === undefined) {
-                    throw error;
+            // Each adaptation flips a flag it also tests, so every failure mode is
+            // tried at most once and a persistent error still surfaces.
+            for (;;) {
+                try {
+                    return yield this.request(instructions, input);
                 }
-                console.warn(`Model "${this.config.model}" does not accept a temperature; retrying without it.`);
-                this.temperature = undefined;
-                return this.request(instructions, input);
+                catch (error) {
+                    if (!this.adapt(error))
+                        throw error;
+                }
             }
         });
     }
+    /**
+     * Reacts to a request-shaped failure the run can recover from.
+     *
+     * Returns true when something was changed and the call is worth repeating.
+     */
+    adapt(error) {
+        if (this.temperature !== undefined &&
+            isUnsupportedTemperatureError(error)) {
+            console.warn(`Model "${this.config.model}" does not accept a temperature; retrying without it.`);
+            this.temperature = undefined;
+            return true;
+        }
+        if (this.endpoint === "responses" && isResponsesUnavailable(error)) {
+            console.warn(`The Responses endpoint is not available for this API key ` +
+                `(${describeApiError(error)}); falling back to Chat Completions for the rest of this run. ` +
+                `Set OPENAI_API_ENDPOINT: chat to make this explicit.`);
+            this.endpoint = "chat";
+            return true;
+        }
+        return false;
+    }
     request(instructions, input) {
-        return this.config.endpoint === "responses"
+        return this.endpoint === "responses"
             ? this.viaResponses(instructions, input)
             : this.viaChatCompletions(instructions, input);
     }
