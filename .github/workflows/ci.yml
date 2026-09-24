@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - run: yarn install --frozen-lockfile
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Build, bundle and test
+        run: yarn test
+
+      # GitHub runs `dist/index.js`, not `src/`. A change to src that is not
+      # re-bundled ships nothing, silently — this is the check that catches it.
+      - name: Fail if dist/ is out of date
+        run: |
+          if ! git diff --quiet --exit-code dist/; then
+            echo "::error::dist/ is stale. Run 'yarn test' (or 'yarn build && yarn package') and commit the result."
+            git diff --stat dist/
+            exit 1
+          fi

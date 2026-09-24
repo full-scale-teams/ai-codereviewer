@@ -1,27 +1,81 @@
 name: "AI Code Review Action"
-description: "Perform code reviews and comment on diffs using OpenAI API."
+description: "On-demand pull request review powered by the OpenAI API, triggered by a comment."
+
 inputs:
   GITHUB_TOKEN:
-    description: "GitHub token to interact with the repository."
+    description: "GitHub token used to read the diff and post the review."
     required: true
   OPENAI_API_KEY:
-    description: "OpenAI API key for GPT."
+    description: "OpenAI API key."
     required: true
   OPENAI_API_MODEL:
-    description: "OpenAI API model."
+    description: "OpenAI model id. Must support Structured Outputs."
     required: false
-    default: "gpt-4"
-  exclude:
-    description: "Glob patterns to exclude files from the diff analysis"
+    default: "gpt-4o"
+  OPENAI_API_ENDPOINT:
+    description: >-
+      Which OpenAI endpoint to use: "responses" (default, current) or "chat"
+      (legacy Chat Completions, kept as a fallback).
+    required: false
+    default: "responses"
+  OPENAI_TEMPERATURE:
+    description: "Sampling temperature, 0-2. Ignored by models that do not accept it."
+    required: false
+    default: "0.2"
+  OPENAI_MAX_OUTPUT_TOKENS:
+    description: "Output token ceiling per request."
+    required: false
+    default: "2000"
+
+  TRIGGER_PHRASE:
+    description: "Phrase a pull request comment must contain to request a review."
+    required: false
+    default: "@openai review"
+  ALLOWED_ASSOCIATIONS:
+    description: >-
+      Comma-separated GitHub author_association values permitted to trigger a
+      review. Guards the API budget against drive-by comments.
+    required: false
+    default: "OWNER,MEMBER,COLLABORATOR"
+  PR_NUMBER:
+    description: "Pull request to review. Only needed for workflow_dispatch runs."
     required: false
     default: ""
+
   REVIEW_PROMPT:
-    description: "Optional custom review prompt prefix"
+    description: "Replaces the built-in reviewer instructions entirely. Usually left empty."
     required: false
     default: ""
+  PROJECT_CONTEXT:
+    description: "Repository-specific context appended to the built-in instructions."
+    required: false
+    default: ""
+  exclude:
+    description: "Comma-separated glob patterns excluded from review."
+    required: false
+    default: ""
+
+  MAX_FILES:
+    description: "Maximum files to review, largest diffs first."
+    required: false
+    default: "40"
+  MAX_COMMENTS:
+    description: "Maximum comments to post, most severe first."
+    required: false
+    default: "25"
+  MAX_REQUEST_CHARS:
+    description: "Rendered-diff character budget per model request."
+    required: false
+    default: "12000"
+  CONCURRENCY:
+    description: "Model requests in flight at once."
+    required: false
+    default: "3"
+
 runs:
-  using: "node16"
+  using: "node20"
   main: "dist/index.js"
+
 branding:
   icon: "aperture"
   color: "green"

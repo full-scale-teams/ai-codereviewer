@@ -1,20 +1,53 @@
-name: Code Review with OpenAI
+name: AI Code Review
+
+# Reviews run on request, never automatically. A developer asks for one by
+# commenting the trigger phrase on the pull request.
+#
+# NOTE: GitHub loads `issue_comment` workflows from the DEFAULT BRANCH only.
+# Changes to this file take effect once they land on the default branch.
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-permissions: write-all
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to review"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write # to react to the triggering comment
+
+# One review at a time per pull request. A second request queues rather than
+# racing the first, so two runs cannot post overlapping comments.
+concurrency:
+  group: ai-code-review-${{ github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: false
+
 jobs:
   code_review:
+    # Cheap pre-filter: without it every comment on every issue starts a runner.
+    # Keep the phrase here identical to TRIGGER_PHRASE below.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '@openai review'))
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-      - name: Code Review
-        uses: freeedcom/ai-codereviewer@main
+      # Required only because this workflow runs the action from `./`. A
+      # consumer repo referencing `full-scale-teams/ai-codereviewer@main` needs
+      # no checkout: the action reads the diff over the API.
+      - uses: actions/checkout@v4
+
+      - name: Review this repository with its own action
+        uses: ./
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_API_MODEL: "gpt-4-1106-preview"
-          exclude: "yarn.lock,dist/**"
+          OPENAI_API_MODEL: "gpt-4o"
+          TRIGGER_PHRASE: "@openai review"
+          PR_NUMBER: ${{ inputs.pr_number }}
+          exclude: "yarn.lock,dist/**,**/*.md"
